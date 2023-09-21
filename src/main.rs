@@ -495,5 +495,5 @@ async fn get_format_config(path: Option<PathBuf>) -> Result<LogFormat, anyhow::E
         .lines()
         .map(|line| JsonKey::from(line.to_string()))
         .collect();
-    Ok(LogFormat::text(" ".to_string(), keys))
+    Ok(LogFormat::text(" | ".to_string(), keys))
 }
