@@ -265,8 +265,8 @@ async fn file_writer(
 async fn stdout_writer(format: LogFormat, mut recv: mpsc::Receiver<WriterMessage>) {
     info!("Started writing to stdout");
     let mut stdout = tokio::io::stdout();
-    let mut buf: Vec<u8> = Vec::new();
     while let Some(msg) = recv.recv().await {
+        let mut buf: Vec<u8> = Vec::new();
         match msg {
             WriterMessage::NewLog(event) => {
                 writeln!(buf, "{}", format.format(&event)).unwrap();
