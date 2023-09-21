@@ -27,8 +27,7 @@ Refactoring, and want to see what logs are more noise than they're worth? This e
 
 ## Installation
 ```
-git clone ...
-cargo install --path .
+cargo install dogtail
 ```
 
 ## Configuration
