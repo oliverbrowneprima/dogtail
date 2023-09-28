@@ -1,66 +1,79 @@
-use std::{
-    collections::{HashMap, HashSet},
-    io::Write,
-    path::PathBuf,
-    time::Duration,
-};
+use std::{collections::HashMap, io::Write, path::PathBuf};
 
-use clap::{Parser, ValueEnum};
-use reqwest::{RequestBuilder, Response};
+use chrono::{DateTime, Utc};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use logs::LogQuery;
+use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Value};
+use tailer::Tailer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::task::JoinHandle;
 use tokio::{fs::File, sync::mpsc};
-use tracing::{debug, info, warn, Instrument};
+use tracing::{info, trace, Instrument};
 use tracing_subscriber::{
     prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry,
 };
 use tracing_tree::{time::UtcDateTime, HierarchicalLayer};
 
-const LOG_RETURN_LIMIT: u32 = 1000;
-const BE_A_LITTLE_EVIL: bool = false;
+mod logs;
+mod tailer;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum Mode {
     File,
     Stdout,
 }
-
-impl Mode {
-    // Only async to force an async caller, since we tokio::spawn
-    fn get_writer(&self, writer_id: String, format: LogFormat) -> mpsc::Sender<WriterMessage> {
-        let (tx, rx) = mpsc::channel(100);
-        match self {
-            Mode::File => tokio::spawn(file_writer(writer_id, format, rx)),
-            Mode::Stdout => tokio::spawn(stdout_writer(format, rx)),
-        };
-        tx
-    }
-}
-
 /// Tail datadog logs to files, or stdout
 #[derive(Parser)]
 #[command(author, version, about)]
-struct Args {
+struct Cli {
+    /// The domain to use for the API
+    #[arg(short = 'd', long, default_value = "api.datadoghq.eu")]
+    domain: String,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Logs(LogsCommand),
+}
+
+#[derive(Args)]
+struct LogsCommand {
     /// A query string, the same as you would use in the UI, e.g. "service:my-service"
     query_string: String,
     /// The domain to use for the API
     #[arg(short = 'd', long, default_value = "api.datadoghq.eu")]
     domain: String,
     /// Mode - If file, log events will be partitioned by split_key and written to files, if stdout, logs will be written to stdout
-    #[arg(short = 'm', long, default_value = "file")]
-    mode: Mode,
+    #[arg(short = 'o', long, default_value = "file")]
+    output_mode: Mode,
     /// If mode is file, this is the event attribute lookup key to use for partitioning logs. Uses json-pointer syntax, e.g. "attributes.tags.pod_name".
     /// Note that event tags are unpacked into a map, so you can use tags "attributes.tags.pod_name" for this purpose. If an event doesn't have the
-    /// split key, it is written to output.log
+    /// split key, it is written to the default file.
     #[arg(short = 'k', long)]
     split_key: Option<String>,
-    /// A file to load a formatting config from. The formatting config if a newline separated list of json-pointer keys - each output line will be
+    /// The place logs that can't be split by split-key will be written to. If mode is stdout, this is ignored.
+    #[arg(short = 'f', long, default_value = "output.log")]
+    default_output: String,
+    /// A file to load a formatting config from. The formatting config is a newline separated list of json-pointer keys - each output line will be
     /// the found value of each of those keys, joined by a space. If none is provided, a default logging format of "timestamp status message" will be used.
     #[arg(long)]
     format_file: Option<PathBuf>,
     /// If true, structured json will be written to the output instead of formatted logs, with one event written per line.
     #[arg(short = 's', long)]
     structured: bool,
+
+    /// Provide a number of seconds in the past to start tailing from.
+    #[arg(short = 'h', long, default_value = "60")]
+    history: u64,
+
+    /// Run the search once, rather than tailing the logs. If this is set, `history` becomes the number of seconds after this instant to get logs
+    /// from. Accepts rfc3339 timestamps, e.g. "2021-01-01T00:00:00Z"
+    #[arg(short = 't', long, value_parser = parse_date_time)]
+    from: Option<DateTime<Utc>>,
 }
 
 // Tokio main function
@@ -76,30 +89,109 @@ async fn main() {
                 .with_timer(UtcDateTime),
         )
         .init();
-    let args = Args::parse();
+    let args = Cli::parse();
 
     let api_key = std::env::var("DD_API_KEY").expect("Expected DD_API_KEY env var");
     let app_key = std::env::var("DD_APP_KEY").expect("Expected DD_APP_KEY env var");
 
-    let format = if args.structured {
+    match args.command {
+        Command::Logs(logs) => run_logs(logs, api_key, app_key).await.unwrap(),
+    }
+}
+
+async fn run_logs(
+    logs: LogsCommand,
+    api_key: String,
+    app_key: String,
+) -> Result<(), anyhow::Error> {
+    let format = if logs.structured {
         LogFormat::Structured
     } else {
-        get_format_config(args.format_file).await.unwrap()
+        get_format_config(logs.format_file).await?
     };
 
-    let mut pool = WriterPool::new(args.split_key.map(String::into), format, args.mode);
+    let mut pool = WriterPool::new(
+        logs.split_key.map(String::into),
+        format,
+        logs.output_mode,
+        logs.default_output,
+    );
 
-    let mut tailer = Tailer::new(args.domain, api_key, app_key, args.query_string);
-    loop {
-        for event in tailer.get_next().await.unwrap() {
-            pool.consume(event).await.unwrap();
-        }
+    let tailer = Tailer::new(
+        api_key,
+        app_key,
+        Box::new(LogQuery::new(
+            logs.domain,
+            logs.query_string,
+            logs.history,
+            logs.from,
+        )),
+    );
+
+    let mut tail = tailer.start(logs.from.is_some()).await;
+
+    while let Some(event) = tail.recv().await {
+        trace!("Received event");
+        pool.consume(event).await?;
     }
+
+    pool.finish().await;
+
+    Ok(())
+}
+
+pub trait Query: Send + Sync {
+    fn get_query(&mut self, client: &Client) -> RequestBuilder;
+    fn get_results(&mut self, body: Value) -> Result<Vec<Value>, anyhow::Error>;
+    fn get_next<'a>(&mut self, body: &'a Value) -> Result<Option<String>, anyhow::Error> {
+        let Some(next) = body.get("links").map(|l| l.get("next")).flatten() else {
+            return Ok(None);
+        };
+        next.as_str()
+            .ok_or(anyhow::anyhow!("Next url not a string"))
+            .map(|s| Some(s.to_string()))
+    }
+
+    fn get_batch_size(&mut self) -> usize;
+}
+
+struct WriterPool {
+    writers: HashMap<String, (JoinHandle<()>, mpsc::Sender<WriterMessage>)>,
+    split_key: Option<JsonKey>,
+    format: LogFormat,
+    mode: Mode,
+    default: String,
 }
 
 // Kinda json-pointer, but not really
 #[derive(Clone)]
 struct JsonKey(Vec<String>);
+
+#[derive(Clone)]
+enum LogFormat {
+    Text { sep: String, keys: Vec<JsonKey> },
+    Structured,
+}
+
+enum WriterMessage {
+    NewLog(Value),
+}
+
+impl Mode {
+    // Only async to force an async caller, since we tokio::spawn
+    fn get_writer(
+        &self,
+        writer_id: String,
+        format: LogFormat,
+    ) -> (JoinHandle<()>, mpsc::Sender<WriterMessage>) {
+        let (tx, rx) = mpsc::channel(100);
+        let handle = match self {
+            Mode::File => tokio::spawn(file_writer(writer_id, format, rx)),
+            Mode::Stdout => tokio::spawn(stdout_writer(format, rx)),
+        };
+        (handle, tx)
+    }
+}
 
 impl JsonKey {
     fn get(&self, event: &Value) -> Option<Value> {
@@ -121,12 +213,6 @@ impl From<&str> for JsonKey {
     fn from(s: &str) -> Self {
         JsonKey(s.split('.').map(|s| s.to_string()).collect())
     }
-}
-
-#[derive(Clone)]
-enum LogFormat {
-    Text { sep: String, keys: Vec<JsonKey> },
-    Structured,
 }
 
 impl LogFormat {
@@ -181,35 +267,28 @@ impl Default for LogFormat {
     }
 }
 
-struct WriterPool {
-    writers: HashMap<String, mpsc::Sender<WriterMessage>>,
-    split_key: Option<JsonKey>,
-    format: LogFormat,
-    mode: Mode,
-}
-
 impl WriterPool {
-    fn new(split_key: Option<JsonKey>, format: LogFormat, mode: Mode) -> Self {
+    fn new(split_key: Option<JsonKey>, format: LogFormat, mode: Mode, default: String) -> Self {
         WriterPool {
             writers: HashMap::new(),
             split_key,
             format,
             mode,
+            default,
         }
     }
 
     #[tracing::instrument(level = "trace", skip(self, event))]
     async fn consume(&mut self, event: Value) -> Result<(), anyhow::Error> {
-        let event = unpack_tags(event);
         let writer_id = if let Some(split_key) = &self.split_key {
             split_key
                 .get(&event)
-                .unwrap_or(json!("output"))
+                .unwrap_or(json!(&self.default))
                 .as_str()
                 .ok_or(anyhow::anyhow!("Writer id not a string"))?
                 .to_string()
         } else {
-            "output".to_string()
+            self.default.clone()
         };
 
         let writer_id = if let Mode::Stdout = self.mode {
@@ -218,7 +297,7 @@ impl WriterPool {
             writer_id
         };
 
-        let writer = self
+        let (_, writer) = self
             .writers
             .entry(writer_id.clone())
             .or_insert_with(|| self.mode.get_writer(writer_id, self.format.clone()));
@@ -227,10 +306,13 @@ impl WriterPool {
 
         Ok(())
     }
-}
 
-enum WriterMessage {
-    NewLog(Value),
+    async fn finish(mut self) {
+        for (_, (handle, tx)) in self.writers.drain() {
+            drop(tx);
+            let _ = handle.await;
+        }
+    }
 }
 
 // I love that async functions mean I don't even need a struct here - the implied future holds all my state
@@ -241,11 +323,11 @@ async fn file_writer(
     format: LogFormat,
     mut recv: mpsc::Receiver<WriterMessage>,
 ) {
-    info!("Started writing to file: {}.log", writer_id);
+    info!("Started writing to file: {}", writer_id);
     let mut file = File::options()
         .append(true)
         .create(true)
-        .open(format!("{}.log", writer_id))
+        .open(format!("{}", writer_id))
         .await
         .unwrap();
 
@@ -260,6 +342,7 @@ async fn file_writer(
             }
         }
     }
+    info!("Finished writing to file: {}", writer_id);
 }
 
 async fn stdout_writer(format: LogFormat, mut recv: mpsc::Receiver<WriterMessage>) {
@@ -275,212 +358,7 @@ async fn stdout_writer(format: LogFormat, mut recv: mpsc::Receiver<WriterMessage
             }
         }
     }
-}
-
-struct Tailer {
-    search_url: String,
-    query_string: String,
-    client: reqwest::Client,
-    api_key: String,
-    app_key: String,
-    seen_event_ids: HashSet<String>, // We don't want to return the same event twice
-    total_returned: usize,
-}
-
-impl Tailer {
-    fn new(dd_domain: String, api_key: String, app_key: String, query_string: String) -> Self {
-        Tailer {
-            search_url: format!("https://{}/api/v2/logs/events/search", dd_domain),
-            client: reqwest::Client::new(),
-            api_key,
-            app_key,
-            query_string,
-            seen_event_ids: HashSet::new(),
-            total_returned: 0,
-        }
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn get_next(&mut self) -> Result<Vec<Value>, anyhow::Error> {
-        let returned = self.get_events().await?;
-
-        let returned_count = returned.len();
-        debug!("Got {} events", returned_count);
-
-        let mut unseen = Vec::with_capacity(returned.len());
-        for event in returned {
-            let event_id = event["id"].as_str().unwrap().to_string();
-            if self.seen_event_ids.insert(event_id) {
-                unseen.push(event);
-            }
-        }
-
-        if unseen.len() == returned_count {
-            // We filtered no events based on the existing seen event ids, so we can clear them
-            // and only retain the ones returned this time
-            debug!("Clearing seen event ids");
-            self.seen_event_ids.clear();
-            for event in unseen.iter() {
-                let event_id = event["id"].as_str().unwrap().to_string();
-                self.seen_event_ids.insert(event_id);
-            }
-        }
-
-        self.total_returned += unseen.len();
-        info!(
-            "Found {} events to write, total written: {}",
-            unseen.len(),
-            self.total_returned
-        );
-        Ok(unseen)
-    }
-
-    fn headers(&self, builder: RequestBuilder) -> RequestBuilder {
-        builder
-            .header("Accept", "application/json")
-            .header("DD-API-KEY", &self.api_key)
-            .header("DD-APPLICATION-KEY", &self.app_key)
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn get_events(&mut self) -> Result<Vec<Value>, anyhow::Error> {
-        // TODO - the width of this sliding window should shrink if we are regularly following
-        // next links, and grow if we aren't
-        let from = "now - 60s";
-
-        let query = json!({
-            "filter": {
-                "from": from,
-                "query": self.query_string
-            },
-            "page": {
-                "limit": LOG_RETURN_LIMIT
-            },
-            "sort": "timestamp"
-        });
-
-        debug!("Running query: {:?}", query);
-
-        let first = self
-            .headers(self.client.post(&self.search_url).json(&query))
-            .send()
-            .await?;
-
-        RateLimitStatus::from(&first).pause().await;
-
-        // We pause before checking status to ensure that if we get a 429,
-        // we don't make another request until the rate limit is reset
-        if !first.status().is_success() {
-            return self.handle_error(first).await;
-        }
-
-        let mut body: Value = first.json().await?;
-        let mut returned = get_events_from_response_body(&body)?;
-
-        while let Some(next_url) = body.get("links").map(|l| l.get("next")).flatten() {
-            let next_url = next_url
-                .as_str()
-                .ok_or(anyhow::anyhow!("Next url not a string"))?;
-            debug!("Next url: {}", next_url);
-
-            let response = self.headers(self.client.get(next_url)).send().await?;
-            RateLimitStatus::from(&response).pause().await;
-
-            if !response.status().is_success() {
-                self.handle_error(response).await?;
-                continue; // If we hit a 429 while following next links, we should just re-request that page
-            }
-
-            body = response.json().await?;
-            returned.extend(get_events_from_response_body(&body)?);
-        }
-
-        Ok(returned)
-    }
-
-    async fn handle_error(&mut self, response: Response) -> Result<Vec<Value>, anyhow::Error> {
-        match response.status() {
-            reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                warn!("Got too_many_requests, waiting and retrying");
-                Ok(vec![]) // We have the correct interval period, we can just wait and then retry
-            }
-            _ => Err(anyhow::anyhow!("Error: {}", response.text().await.unwrap())),
-        }
-    }
-}
-
-fn unpack_tags(mut event: Value) -> Value {
-    if let Some(tags) = event["attributes"]["tags"].as_array() {
-        let mut unpacked = HashMap::new();
-        for tag in tags {
-            if let Some(str) = tag.as_str() {
-                let mut split = str.split(':');
-                let key = split.next().unwrap();
-                let value = split.next().unwrap();
-                unpacked.insert(key, value);
-            }
-        }
-        event["attributes"]["tags"] = json!(unpacked);
-    }
-    event
-}
-
-fn get_events_from_response_body(body: &Value) -> Result<Vec<Value>, anyhow::Error> {
-    let Some(events) = body.get("data") else {
-        return Ok(vec![]);
-    };
-
-    Ok(events
-        .as_array()
-        .ok_or(anyhow::anyhow!("Log query data not a list"))?
-        .into_iter()
-        .cloned()
-        .collect())
-}
-
-#[derive(Debug)]
-struct RateLimitStatus {
-    limit: u32,
-    period: Duration,
-    remaining: u32,
-    time_until_reset: Duration,
-}
-
-impl From<&Response> for RateLimitStatus {
-    fn from(response: &Response) -> Self {
-        let get = |key: &str| response.headers().get(key).unwrap().to_str().unwrap();
-
-        let limit = get("x-ratelimit-limit").parse().unwrap();
-        let period = Duration::from_secs(get("x-ratelimit-period").parse().unwrap());
-        let remaining = get("x-ratelimit-remaining").parse().unwrap();
-        let time_until_reset = Duration::from_secs(get("x-ratelimit-reset").parse().unwrap());
-
-        let status = RateLimitStatus {
-            limit,
-            period,
-            remaining,
-            time_until_reset,
-        };
-        debug!("Rate limit status: {:?}", status);
-        status
-    }
-}
-
-// In order to be a good citizen, we always wait until reset + [0.0..5.0) seconds before requesting again
-// TODO - this is an antipattern - it should be impossible to make another request until the rate limit is reset
-impl RateLimitStatus {
-    async fn pause(&self) {
-        let wait = self.time_until_reset;
-        let jitter = Duration::from_secs_f32(rand::random::<f32>() * 5.0);
-        let wait = wait + jitter;
-        if BE_A_LITTLE_EVIL && self.remaining > 0 {
-            return; // If we have api budget left, use it, even if this means other users are likely to hit a 429
-        }
-        if wait > Duration::from_secs(0) {
-            debug!("Waiting {}s", wait.as_secs());
-            tokio::time::sleep(wait).await;
-        }
-    }
+    info!("Finished writing to stdout");
 }
 
 async fn get_format_config(path: Option<PathBuf>) -> Result<LogFormat, anyhow::Error> {
@@ -496,4 +374,8 @@ async fn get_format_config(path: Option<PathBuf>) -> Result<LogFormat, anyhow::E
         .map(|line| JsonKey::from(line.to_string()))
         .collect();
     Ok(LogFormat::text(" | ".to_string(), keys))
+}
+
+fn parse_date_time(s: &str) -> Result<DateTime<Utc>, anyhow::Error> {
+    Ok(DateTime::parse_from_rfc3339(s)?.with_timezone(&Utc))
 }
