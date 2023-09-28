@@ -107,7 +107,12 @@ async fn run_logs(
         get_format_config(logs.format_file).await?
     };
 
-    let sink_set = OutputMode::new(logs.output_mode, logs.split_key, format);
+    let sink_set = OutputMode::new(
+        logs.output_mode,
+        logs.split_key,
+        format,
+        logs.default_output,
+    );
     let mut pool = ConsumerPool::new(Box::new(sink_set));
 
     let source = if let Some(from) = logs.from {
@@ -138,15 +143,17 @@ struct OutputMode {
     mode: Mode,
     split_key: Option<JsonKey>,
     format: LogFormat,
+    default: String,
 }
 
 impl OutputMode {
-    fn new(mode: Mode, split_key: Option<String>, format: LogFormat) -> Self {
+    fn new(mode: Mode, split_key: Option<String>, format: LogFormat, default: String) -> Self {
         let split_key = split_key.map(|s| JsonKey::from(s));
         OutputMode {
             mode,
             split_key,
             format,
+            default,
         }
     }
 }
@@ -168,13 +175,13 @@ impl SinkSet for OutputMode {
 
     fn get_sink_id(&self, event: &Value) -> String {
         let Some(key) = &self.split_key else {
-            return "output".to_string();
+            return self.default.clone();
         };
         let id = key
             .get(event)
             .map(|v| v.as_str().map(|s| s.to_string()))
             .flatten()
-            .unwrap_or("output".to_string());
+            .unwrap_or(self.default.clone());
 
         id
     }
