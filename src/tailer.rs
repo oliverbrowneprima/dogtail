@@ -1,17 +1,19 @@
-use std::{
-    convert::Infallible,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use reqwest::{RequestBuilder, Response};
 use serde_json::Value;
 use tokio::sync::mpsc::{self, Receiver};
 use tracing::{debug, info, instrument, warn};
 
-use crate::Query;
+use crate::Source;
 
+/// The Tailer handles authentication, rate limiting, and pagination for a given source,
+/// and returns a receiver that will emit events as they are received. This lets you only
+/// worry about implementing the Source. The Tailer assumes the datadog rate-limit headers
+/// are present, and will scale how long it waits between requests based on 1) not exceeding
+/// the rate limit, and 2) how many useful results it got from the last request.
 pub struct Tailer {
-    query: Box<dyn Query>,
+    source: Box<dyn Source>,
     client: reqwest::Client,
     api_key: String,
     app_key: String,
@@ -19,9 +21,10 @@ pub struct Tailer {
 }
 
 impl Tailer {
-    pub fn new(api_key: String, app_key: String, query: Box<dyn Query>) -> Self {
+    /// Construct a tailer from a source, and the necessary API keys.
+    pub fn new(api_key: String, app_key: String, source: Box<dyn Source>) -> Self {
         Tailer {
-            query,
+            source,
             client: reqwest::Client::new(),
             api_key,
             app_key,
@@ -29,30 +32,23 @@ impl Tailer {
         }
     }
 
-    // Async purely to force calling from an async context
-    pub async fn start(self, one_shot: bool) -> Receiver<Value> {
+    /// Start tailing from the passed source, returning a receiver that will emit
+    /// events as they are received
+    pub async fn start(self) -> Receiver<Value> {
         let (send, recv) = mpsc::channel(100);
         tokio::spawn(async move {
             let mut _self = self; // "But we can open the box" said toad. "That's true" said frog.
-            if one_shot {
-                _self.run_once(send).await;
-            } else {
-                _self.tail(send).await;
-            }
+            _self.tail(send).await;
         });
         recv
     }
 
     #[instrument(level = "debug", skip_all)]
-    pub async fn run_once(mut self, event_sink: mpsc::Sender<Value>) {
-        self.step(&event_sink).await;
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    pub async fn tail(&mut self, event_sink: mpsc::Sender<Value>) -> Infallible {
-        loop {
-            self.step(&event_sink).await;
-
+    async fn tail(&mut self, event_sink: mpsc::Sender<Value>) {
+        // We just eat the errors here, since we've been tokio::spawn'd. Dropping
+        // the sender should be enough to signal to consumer that we're done
+        while let Ok(Some(count)) = self.run_query(&event_sink).await {
+            info!("Returned {} events", count);
             let seconds_to_next_call = self
                 .last_limit_stats
                 .as_ref()
@@ -65,15 +61,6 @@ impl Tailer {
 
             println!("Waiting {}s", seconds_to_next_call);
         }
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    async fn step(&mut self, send: &mpsc::Sender<Value>) {
-        // We unwrap here because if we get an error while running the query, we should
-        // panic, and propagate that panic to the rest of the program.
-        let returned_count = self.run_query(&send).await.unwrap();
-
-        info!("Returned {} values", returned_count);
     }
 
     fn headers(&self, builder: RequestBuilder) -> RequestBuilder {
@@ -97,27 +84,31 @@ impl Tailer {
     async fn run_query(
         &mut self,
         event_sink: &mpsc::Sender<Value>,
-    ) -> Result<usize, anyhow::Error> {
-        let req = self.query.get_query(&self.client);
+    ) -> Result<Option<usize>, anyhow::Error> {
+        let Some(req) = self.source.construct_query(&self.client) else {
+            info!("Source returned None, stopping");
+            return Ok(None);
+        };
+
         let first = self.send(self.headers(req)).await?;
 
         if !first.status().is_success() {
-            return self.handle_error(first, 0).await;
+            return self.handle_error(first, 0).await.map(|o| Some(o));
         }
 
         let body: Value = first.json().await?;
 
         let mut returned = 0;
 
-        let mut next = self.query.get_next(&body)?;
+        let mut next = self.source.extract_next(&body)?;
 
-        for v in self.query.get_results(body)? {
+        for v in self.source.extract_results(body)? {
             returned += 1;
             event_sink.send(v).await?;
         }
 
         self.last_limit_stats.as_mut().map(|s| {
-            s.scale_remaining_by(returned, self.query.get_batch_size());
+            s.scale_remaining_by(returned, self.source.get_batch_size());
         });
 
         while let Some(next_url) = &next {
@@ -131,13 +122,13 @@ impl Tailer {
 
             let body = response.json().await?;
 
-            next = self.query.get_next(&body)?;
+            next = self.source.extract_next(&body)?;
 
-            let results = self.query.get_results(body)?;
+            let results = self.source.extract_results(body)?;
 
             self.last_limit_stats
                 .as_mut()
-                .map(|s| s.scale_remaining_by(results.len(), self.query.get_batch_size()));
+                .map(|s| s.scale_remaining_by(results.len(), self.source.get_batch_size()));
 
             for v in results {
                 returned += 1;
@@ -145,7 +136,7 @@ impl Tailer {
             }
         }
 
-        Ok(returned)
+        Ok(Some(returned))
     }
 
     async fn handle_error(
@@ -176,10 +167,20 @@ impl From<&Response> for RateLimitStatus {
 
         // TODO - figure out a use for this in the wait time calculation
         // let limit = get("x-ratelimit-limit").parse().unwrap();
-        let period = Duration::from_secs(get("x-ratelimit-period").parse().unwrap());
-        let remaining_budget = get("x-ratelimit-remaining").parse().unwrap();
-        let reset_time =
-            Instant::now() + Duration::from_secs(get("x-ratelimit-reset").parse().unwrap());
+        let period = Duration::from_secs(
+            get("x-ratelimit-period")
+                .parse()
+                .expect("Header x-ratelimit-period not found"),
+        );
+        let remaining_budget = get("x-ratelimit-remaining")
+            .parse()
+            .expect("Header x-ratelimit-remaining not found");
+        let reset_time = Instant::now()
+            + Duration::from_secs(
+                get("x-ratelimit-reset")
+                    .parse()
+                    .expect("Header x-ratelimit-reset not found"),
+            );
 
         let status = RateLimitStatus {
             period,

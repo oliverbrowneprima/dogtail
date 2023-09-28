@@ -1,22 +1,19 @@
-use std::{collections::HashMap, io::Write, path::PathBuf};
+use std::{io::Write, path::PathBuf};
 
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use logs::LogQuery;
-use reqwest::{Client, RequestBuilder};
-use serde_json::{json, Value};
-use tailer::Tailer;
+use dogtail::logs::{Follow, LogFormat, LogSource, Snapshot};
+use dogtail::sink::{ConsumerPool, Sink, SinkMessage, SinkSet};
+use dogtail::tailer::Tailer;
+use dogtail::{JsonKey, Source};
+use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::task::JoinHandle;
 use tokio::{fs::File, sync::mpsc};
 use tracing::{info, trace, Instrument};
 use tracing_subscriber::{
     prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry,
 };
 use tracing_tree::{time::UtcDateTime, HierarchicalLayer};
-
-mod logs;
-mod tailer;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum Mode {
@@ -110,255 +107,77 @@ async fn run_logs(
         get_format_config(logs.format_file).await?
     };
 
-    let mut pool = WriterPool::new(
-        logs.split_key.map(String::into),
-        format,
-        logs.output_mode,
-        logs.default_output,
-    );
+    let sink_set = OutputMode::new(logs.output_mode, logs.split_key, format);
+    let mut pool = ConsumerPool::new(Box::new(sink_set));
 
-    let tailer = Tailer::new(
-        api_key,
-        app_key,
-        Box::new(LogQuery::new(
-            logs.domain,
-            logs.query_string,
-            logs.history,
-            logs.from,
-        )),
-    );
+    let source = if let Some(from) = logs.from {
+        let mode = Snapshot::new(from, logs.history);
+        let source = LogSource::new(logs.domain, logs.query_string, mode);
+        Box::new(source) as Box<dyn Source>
+    } else {
+        let mode = Follow::new(logs.history);
+        let source = LogSource::new(logs.domain, logs.query_string, mode);
+        Box::new(source) as Box<dyn Source>
+    };
 
-    let mut tail = tailer.start(logs.from.is_some()).await;
+    let tailer = Tailer::new(api_key, app_key, source);
+
+    let mut tail = tailer.start().await;
 
     while let Some(event) = tail.recv().await {
         trace!("Received event");
         pool.consume(event).await?;
     }
 
-    pool.finish().await;
+    pool.finish(5).await;
 
     Ok(())
 }
 
-pub trait Query: Send + Sync {
-    fn get_query(&mut self, client: &Client) -> RequestBuilder;
-    fn get_results(&mut self, body: Value) -> Result<Vec<Value>, anyhow::Error>;
-    fn get_next<'a>(&mut self, body: &'a Value) -> Result<Option<String>, anyhow::Error> {
-        let Some(next) = body.get("links").map(|l| l.get("next")).flatten() else {
-            return Ok(None);
-        };
-        next.as_str()
-            .ok_or(anyhow::anyhow!("Next url not a string"))
-            .map(|s| Some(s.to_string()))
-    }
-
-    fn get_batch_size(&mut self) -> usize;
-}
-
-struct WriterPool {
-    writers: HashMap<String, (JoinHandle<()>, mpsc::Sender<WriterMessage>)>,
+struct OutputMode {
+    mode: Mode,
     split_key: Option<JsonKey>,
     format: LogFormat,
-    mode: Mode,
-    default: String,
 }
 
-// Kinda json-pointer, but not really
-#[derive(Clone)]
-struct JsonKey(Vec<String>);
-
-#[derive(Clone)]
-enum LogFormat {
-    Text { sep: String, keys: Vec<JsonKey> },
-    Structured,
-}
-
-enum WriterMessage {
-    NewLog(Value),
-}
-
-impl Mode {
-    // Only async to force an async caller, since we tokio::spawn
-    fn get_writer(
-        &self,
-        writer_id: String,
-        format: LogFormat,
-    ) -> (JoinHandle<()>, mpsc::Sender<WriterMessage>) {
-        let (tx, rx) = mpsc::channel(100);
-        let handle = match self {
-            Mode::File => tokio::spawn(file_writer(writer_id, format, rx)),
-            Mode::Stdout => tokio::spawn(stdout_writer(format, rx)),
-        };
-        (handle, tx)
-    }
-}
-
-impl JsonKey {
-    fn get(&self, event: &Value) -> Option<Value> {
-        let mut current = event;
-        for key in &self.0 {
-            current = current.get(key)?;
-        }
-        Some(current.clone())
-    }
-}
-
-impl From<String> for JsonKey {
-    fn from(s: String) -> Self {
-        JsonKey(s.split('.').map(|s| s.to_string()).collect())
-    }
-}
-
-impl From<&str> for JsonKey {
-    fn from(s: &str) -> Self {
-        JsonKey(s.split('.').map(|s| s.to_string()).collect())
-    }
-}
-
-impl LogFormat {
-    fn text(sep: String, keys: Vec<JsonKey>) -> Self {
-        LogFormat::Text { sep, keys }
-    }
-
-    fn format(&self, event: &Value) -> String {
-        match self {
-            LogFormat::Text { sep, keys } => Self::format_text(sep, keys, event),
-            LogFormat::Structured => Self::format_raw(event),
-        }
-    }
-
-    fn format_raw(event: &Value) -> String {
-        serde_json::to_string(event).unwrap()
-    }
-
-    fn format_text(sep: &str, keys: &[JsonKey], event: &Value) -> String {
-        let mut output = String::with_capacity(256);
-        // Do this to avoid printing sep before the first key
-        let (first, rest) = keys.split_first().unwrap();
-
-        if let Some(value) = first.get(event) {
-            output.push_str(value.as_str().unwrap_or(format!("{:?}", value).as_str()));
-        } else {
-            output.push_str("KEY_NOT_FOUND");
-        }
-
-        for key in rest {
-            output.push_str(&sep);
-            if let Some(value) = key.get(event) {
-                output.push_str(value.as_str().unwrap_or(format!("{:?}", value).as_str()));
-            } else {
-                output.push_str("KEY_NOT_FOUND");
-            }
-        }
-        return output;
-    }
-}
-
-impl Default for LogFormat {
-    fn default() -> Self {
-        LogFormat::text(
-            " | ".to_string(),
-            vec![
-                JsonKey::from("attributes.timestamp"),
-                JsonKey::from("attributes.status"),
-                JsonKey::from("attributes.message"),
-            ],
-        )
-    }
-}
-
-impl WriterPool {
-    fn new(split_key: Option<JsonKey>, format: LogFormat, mode: Mode, default: String) -> Self {
-        WriterPool {
-            writers: HashMap::new(),
+impl OutputMode {
+    fn new(mode: Mode, split_key: Option<String>, format: LogFormat) -> Self {
+        let split_key = split_key.map(|s| JsonKey::from(s));
+        OutputMode {
+            mode,
             split_key,
             format,
-            mode,
-            default,
-        }
-    }
-
-    #[tracing::instrument(level = "trace", skip(self, event))]
-    async fn consume(&mut self, event: Value) -> Result<(), anyhow::Error> {
-        let writer_id = if let Some(split_key) = &self.split_key {
-            split_key
-                .get(&event)
-                .unwrap_or(json!(&self.default))
-                .as_str()
-                .ok_or(anyhow::anyhow!("Writer id not a string"))?
-                .to_string()
-        } else {
-            self.default.clone()
-        };
-
-        let writer_id = if let Mode::Stdout = self.mode {
-            "stdout".to_string()
-        } else {
-            writer_id
-        };
-
-        let (_, writer) = self
-            .writers
-            .entry(writer_id.clone())
-            .or_insert_with(|| self.mode.get_writer(writer_id, self.format.clone()));
-
-        writer.send(WriterMessage::NewLog(event)).await?;
-
-        Ok(())
-    }
-
-    async fn finish(mut self) {
-        for (_, (handle, tx)) in self.writers.drain() {
-            drop(tx);
-            let _ = handle.await;
         }
     }
 }
 
-// I love that async functions mean I don't even need a struct here - the implied future holds all my state
-// We can be liberal with unwraps here because if this task panics the recv is dropped, propagating the error
-// to the parent task
-async fn file_writer(
-    writer_id: String,
-    format: LogFormat,
-    mut recv: mpsc::Receiver<WriterMessage>,
-) {
-    info!("Started writing to file: {}", writer_id);
-    let mut file = File::options()
-        .append(true)
-        .create(true)
-        .open(format!("{}", writer_id))
-        .await
-        .unwrap();
-
-    while let Some(msg) = recv.recv().await {
-        match msg {
-            WriterMessage::NewLog(event) => {
-                let mut buf: Vec<u8> = Vec::new();
-                writeln!(buf, "{}", format.format(&event)).unwrap();
-                let span = tracing::trace_span!("write_to_file", writer_id = writer_id.as_str());
-                file.write_all(&buf).instrument(span).await.unwrap();
-                file.flush().await.unwrap();
-            }
-        }
+impl SinkSet for OutputMode {
+    fn construct_output(
+        &self,
+        event: &Value,
+        runtime: &tokio::runtime::Handle,
+    ) -> dogtail::sink::Sink {
+        let id = self.get_sink_id(event);
+        let (tx, rx) = mpsc::channel(100);
+        let handle = match self.mode {
+            Mode::File => runtime.spawn(file_writer(id.clone(), self.format.clone(), rx)),
+            Mode::Stdout => runtime.spawn(stdout_writer(self.format.clone(), rx)),
+        };
+        Sink::new(id, handle, tx)
     }
-    info!("Finished writing to file: {}", writer_id);
-}
 
-async fn stdout_writer(format: LogFormat, mut recv: mpsc::Receiver<WriterMessage>) {
-    info!("Started writing to stdout");
-    let mut stdout = tokio::io::stdout();
-    while let Some(msg) = recv.recv().await {
-        let mut buf: Vec<u8> = Vec::new();
-        match msg {
-            WriterMessage::NewLog(event) => {
-                writeln!(buf, "{}", format.format(&event)).unwrap();
-                stdout.write_all(&buf).await.unwrap();
-                stdout.flush().await.unwrap();
-            }
-        }
+    fn get_sink_id(&self, event: &Value) -> String {
+        let Some(key) = &self.split_key else {
+            return "output".to_string();
+        };
+        let id = key
+            .get(event)
+            .map(|v| v.as_str().map(|s| s.to_string()))
+            .flatten()
+            .unwrap_or("output".to_string());
+
+        id
     }
-    info!("Finished writing to stdout");
 }
 
 async fn get_format_config(path: Option<PathBuf>) -> Result<LogFormat, anyhow::Error> {
@@ -378,4 +197,46 @@ async fn get_format_config(path: Option<PathBuf>) -> Result<LogFormat, anyhow::E
 
 fn parse_date_time(s: &str) -> Result<DateTime<Utc>, anyhow::Error> {
     Ok(DateTime::parse_from_rfc3339(s)?.with_timezone(&Utc))
+}
+
+// I love that async functions mean I don't even need a struct here - the implied future holds all my state
+// We can be liberal with unwraps here because if this task panics the recv is dropped, propagating the error
+// to the parent task
+async fn file_writer(writer_id: String, format: LogFormat, mut recv: mpsc::Receiver<SinkMessage>) {
+    info!("Started writing to file: {}", writer_id);
+    let mut file = File::options()
+        .append(true)
+        .create(true)
+        .open(format!("{}", writer_id))
+        .await
+        .unwrap();
+
+    while let Some(msg) = recv.recv().await {
+        match msg {
+            SinkMessage::New(event) => {
+                let mut buf: Vec<u8> = Vec::new();
+                writeln!(buf, "{}", format.format(&event)).unwrap();
+                let span = tracing::trace_span!("write_to_file", writer_id = writer_id.as_str());
+                file.write_all(&buf).instrument(span).await.unwrap();
+                file.flush().await.unwrap();
+            }
+        }
+    }
+    info!("Finished writing to file: {}", writer_id);
+}
+
+async fn stdout_writer(format: LogFormat, mut recv: mpsc::Receiver<SinkMessage>) {
+    info!("Started writing to stdout");
+    let mut stdout = tokio::io::stdout();
+    while let Some(msg) = recv.recv().await {
+        let mut buf: Vec<u8> = Vec::new();
+        match msg {
+            SinkMessage::New(event) => {
+                writeln!(buf, "{}", format.format(&event)).unwrap();
+                stdout.write_all(&buf).await.unwrap();
+                stdout.flush().await.unwrap();
+            }
+        }
+    }
+    info!("Finished writing to stdout");
 }
