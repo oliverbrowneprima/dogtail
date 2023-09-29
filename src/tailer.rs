@@ -59,7 +59,7 @@ impl Tailer {
                 })
                 .unwrap_or(0);
 
-            println!("Waiting {}s", seconds_to_next_call);
+            info!("Waiting {}s", seconds_to_next_call);
         }
     }
 
